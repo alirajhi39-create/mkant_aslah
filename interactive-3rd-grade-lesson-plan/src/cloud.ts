@@ -206,6 +206,138 @@ export function mergeCloudStudents(classroom: Classroom, cloudStudents: CloudStu
   return [...map.values()].sort((a, b) => b.lastActive.localeCompare(a.lastActive));
 }
 
+export type BackupStudent = {
+  id: string;
+  name: string;
+  section: Exclude<Student["section"], "">;
+  completed: Student["completed"];
+  results: Record<string, unknown>;
+  evaluationScore: number;
+  percent: number;
+  completedCount: number;
+  submittedAt: string | null;
+  createdAt?: string;
+  lastActive?: string;
+};
+
+export async function renameCloudStudent(
+  id: string,
+  edits: { name?: string; section?: Exclude<Student["section"], ""> },
+): Promise<{ ok: boolean; error?: string; student?: CloudStudent }> {
+  try {
+    const response = await fetch("/api/rename", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Accept: "application/json" },
+      cache: "no-store",
+      body: JSON.stringify({ password: getTeacherPassword(), classCode: getClassCode(), id, ...edits }),
+    });
+    const data = await parseJson(response);
+    if (!response.ok || !data?.ok) return { ok: false, error: String(data?.error || `HTTP_${response.status}`) };
+    const student = cloudStudentToLocal((data.student ?? {}) as Record<string, unknown>);
+    return { ok: true, student: student ? { ...student, cloud: true } : undefined };
+  } catch {
+    return { ok: false, error: "NETWORK" };
+  }
+}
+
+export async function exportCloudBackup(): Promise<{
+  ok: boolean;
+  error?: string;
+  students?: BackupStudent[];
+}> {
+  try {
+    const response = await fetch("/api/backup", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Accept: "application/json" },
+      cache: "no-store",
+      body: JSON.stringify({ password: getTeacherPassword(), classCode: getClassCode(), action: "export" }),
+    });
+    const data = await parseJson(response);
+    if (!response.ok || !data?.ok) return { ok: false, error: String(data?.error || `HTTP_${response.status}`) };
+    return { ok: true, students: (Array.isArray(data.students) ? data.students : []) as BackupStudent[] };
+  } catch {
+    return { ok: false, error: "NETWORK" };
+  }
+}
+
+export async function importCloudBackup(
+  students: BackupStudent[],
+): Promise<{ ok: boolean; error?: string; imported?: number; skipped?: string[] }> {
+  try {
+    const response = await fetch("/api/backup", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Accept: "application/json" },
+      cache: "no-store",
+      body: JSON.stringify({
+        password: getTeacherPassword(),
+        classCode: getClassCode(),
+        action: "import",
+        students,
+      }),
+    });
+    const data = await parseJson(response);
+    if (!response.ok || !data?.ok) return { ok: false, error: String(data?.error || `HTTP_${response.status}`) };
+    return {
+      ok: true,
+      imported: Number(data.imported) || 0,
+      skipped: Array.isArray(data.skipped) ? (data.skipped as string[]) : [],
+    };
+  } catch {
+    return { ok: false, error: "NETWORK" };
+  }
+}
+
+export function downloadBackupFile(
+  students: BackupStudent[] | CloudStudent[],
+  meta: { classCode: string; teacher: string; school: string; lesson: string },
+) {
+  const payload = {
+    app: "مكانة الصلاة",
+    version: 1,
+    exportedAt: new Date().toISOString(),
+    ...meta,
+    count: students.length,
+    students,
+  };
+  const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json;charset=utf-8" });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  const stamp = new Date().toISOString().slice(0, 10);
+  link.download = `نسخة-احتياطية-مكانة-الصلاة-${stamp}.json`;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  URL.revokeObjectURL(url);
+}
+
+export function parseBackupFile(raw: unknown): BackupStudent[] {
+  const source = Array.isArray(raw) ? raw : raw && typeof raw === "object" && Array.isArray((raw as { students?: unknown }).students)
+    ? ((raw as { students: unknown[] }).students)
+    : [];
+  const mapped: (BackupStudent | null)[] = source.map((item): BackupStudent | null => {
+      const record = item as Record<string, unknown>;
+      if (typeof record.id !== "string" || typeof record.name !== "string") return null;
+      const section = record.section === "٣/١" || record.section === "٣/٢" ? (record.section as Exclude<Student["section"], "">) : null;
+      if (!section) return null;
+      const completedSource = (record.completed ?? {}) as Partial<Record<TaskKey, boolean>>;
+      return {
+        id: record.id,
+        name: record.name,
+        section,
+        completed: Object.fromEntries(TASK_KEYS.map((key) => [key, Boolean(completedSource[key])])) as Student["completed"],
+        results: (record.results ?? {}) as Record<string, unknown>,
+        evaluationScore: Math.max(0, Math.min(3, Number(record.evaluationScore) || 0)),
+        percent: Math.max(0, Math.min(100, Number(record.percent) || 0)),
+        completedCount: Math.max(0, Math.min(4, Number(record.completedCount) || 0)),
+        submittedAt: typeof record.submittedAt === "string" ? record.submittedAt : null,
+        createdAt: typeof record.createdAt === "string" ? record.createdAt : undefined,
+        lastActive: typeof record.lastActive === "string" ? record.lastActive : undefined,
+      } satisfies BackupStudent;
+  });
+  return mapped.filter((student): student is BackupStudent => student !== null);
+}
+
 export async function deleteCloudStudents(
   ids: string[],
   all = false,

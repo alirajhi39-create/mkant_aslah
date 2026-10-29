@@ -33,11 +33,16 @@ import { StudentSubmissionForm } from "./components/StudentSubmissionForm";
 import { StudentGate, SubmissionImport } from "./components/StudentGate";
 import {
   cloudStudentToSubmission,
+  downloadBackupFile,
+  exportCloudBackup,
+  importCloudBackup,
+  renameCloudStudent,
   currentStudentSignature,
   deleteCloudStudents,
   mergeCloudStudents,
   fetchRoster,
   getClassCode,
+  getTeacherPassword,
   probeCloud,
   setClassCode,
   syncStudent,
@@ -45,6 +50,8 @@ import {
   type CloudStudent,
 } from "./cloud";
 import { Icon } from "./components/ui";
+import { lesson, teacher } from "./content";
+import { restoreBackupToClassroom } from "./classroom";
 
 const SESSION_KEY = "salah-session-started";
 
@@ -281,6 +288,11 @@ export default function App() {
     setToast("حُفظ عمل الطالب في سجلّ المعلم، ويمكن لطالب جديد البدء الآن.");
   };
 
+  const onChangeClassroomRestore = useCallback((records: Parameters<typeof restoreBackupToClassroom>[1]) => {
+    setClassroom((previous) => restoreBackupToClassroom(previous, records));
+    setToast("تمت استعادة بيانات الطلاب من النسخة الاحتياطية.");
+  }, []);
+
   const submitStudent = useCallback((name: string, section: Exclude<StudentSection, "">) => {
     setClassroom((previous) => submitStudentData(previous, previous.activeId, { name, section }));
     setToast("تم إرسال اسمك وصفّك إلى المعلم. أحسنت!");
@@ -442,6 +454,60 @@ export default function App() {
             if (result.ok) setCloudRoster([]);
             return result;
           },
+          onRename: async (id, edits) => {
+            const result = await renameCloudStudent(id, edits);
+            if (result.ok) {
+              setCloudRoster((previous) =>
+                previous
+                  ? previous.map((student) =>
+                      student.id === id
+                        ? { ...student, ...edits, cloud: true, lastActive: new Date().toISOString() }
+                        : student,
+                    )
+                  : previous,
+              );
+              setClassroom((previous) => {
+                if (!previous.students.some((student) => student.id === id)) return previous;
+                return {
+                  ...previous,
+                  students: previous.students.map((student) =>
+                    student.id === id ? { ...student, ...edits } : student,
+                  ),
+                  submissions: previous.submissions.map((submission) =>
+                    submission.studentId === id ? { ...submission, ...edits } : submission,
+                  ),
+                };
+              });
+            }
+            return result;
+          },
+          onBackup: async () => {
+            const result = await exportCloudBackup();
+            if (!result.ok || !result.students) return result;
+            downloadBackupFile(result.students, {
+              classCode,
+              teacher: teacher.name,
+              school: teacher.school,
+              lesson: lesson.title,
+            });
+            return { ok: true };
+          },
+          onRestore: async (records) => {
+            const result = await importCloudBackup(records);
+            if (result.ok) await refreshCloudRoster(getTeacherPassword() || "");
+            return result;
+          },
+        }}
+        onDownloadLocalBackup={() => {
+          downloadBackupFile(
+            classroom.students.filter(
+              (student) => student.name !== "طالب الصف الثالث" && Boolean(student.section),
+            ),
+            { classCode, teacher: teacher.name, school: teacher.school, lesson: lesson.title },
+          );
+        }}
+        onRestoreLocal={(records) => {
+          onChangeClassroomRestore(records);
         }}
         onRequestNewStudent={() => {
           writeSession(false);

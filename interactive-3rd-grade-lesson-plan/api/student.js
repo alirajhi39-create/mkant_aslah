@@ -1,5 +1,5 @@
 import { readBody, send, sanitizeClassCode } from "../server/redis.js";
-import { configured, getStudent, providerLabel, saveStudent } from "../server/store.js";
+import { configured, getStudent, isNameLocked, isSectionLocked, providerLabel, saveStudent } from "../server/store.js";
 
 const SECTIONS = ["٣/١", "٣/٢"];
 const TASKS = ["read", "activity", "status", "evaluation"];
@@ -64,13 +64,20 @@ export default async function handler(req, res) {
 
   const completed = cleanBooleanMap(body.completed);
   const doneCount = TASKS.filter((task) => completed[task]).length;
+  // إذا عدّل المعلم الاسم من لوحته، يبقى الاسم المعدّل هو المعتمد حتى لو أرسل جهاز الطالب اسمًا آخر.
+  const nameLocked = isNameLocked(existing);
+  const sectionLocked = isSectionLocked(existing);
+  const finalName = nameLocked ? existing.name : name;
+  const finalSection = sectionLocked ? existing.section : section;
+  const results = cleanResults(body.results);
+  if (nameLocked || sectionLocked) results.__meta = existing.results.__meta;
   const record = {
     id,
-    name,
-    section,
+    name: finalName,
+    section: finalSection,
     token,
     completed,
-    results: cleanResults(body.results),
+    results,
     evaluationScore: clampInt(body.evaluationScore, 0, 3),
     percent: clampInt((doneCount / TASKS.length) * 100, 0, 100),
     completedCount: doneCount,

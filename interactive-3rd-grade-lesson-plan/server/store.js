@@ -95,6 +95,46 @@ export function fromRow(row) {
   };
 }
 
+/* اسم معدّل من المعلم: نحفظ علامة داخل results (بدون تغيير مخطط القاعدة)
+   حتى لا يستطيع جهاز الطالب الكتابة فوقه لاحقًا. */
+export const teacherMeta = (record) =>
+  record && record.results && typeof record.results === "object" && record.results.__meta
+    ? record.results.__meta
+    : {};
+
+export const isNameLocked = (record) => Boolean(teacherMeta(record).nameLocked);
+export const isSectionLocked = (record) => Boolean(teacherMeta(record).sectionLocked);
+
+/** تعديل المعلم للاسم و/أو الشعبة. يُحفظ داخل results.__meta دون تغيير مخطط القاعدة،
+ *  ويمنع جهاز الطالب من الكتابة فوق القيم المعدّلة لاحقًا. */
+export const withTeacherEdits = (record, edits) => {
+  const results = record.results && typeof record.results === "object" ? record.results : {};
+  const previous = teacherMeta(record);
+  const now = new Date().toISOString();
+  const nextName = typeof edits.name === "string" && edits.name.trim() ? edits.name.trim() : record.name;
+  const nextSection = typeof edits.section === "string" && edits.section.trim() ? edits.section.trim() : record.section;
+  const nameChanged = nextName !== record.name;
+  const sectionChanged = nextSection !== record.section;
+
+  return {
+    ...record,
+    name: nextName.slice(0, 48),
+    section: nextSection,
+    results: {
+      ...results,
+      __meta: {
+        ...previous,
+        ...(nameChanged || edits.name !== undefined ? { nameLocked: true, renamedAt: now, previousName: previous.previousName || record.name } : {}),
+        ...(sectionChanged || edits.section !== undefined
+          ? { sectionLocked: true, sectionChangedAt: now, previousSection: previous.previousSection || record.section }
+          : {}),
+      },
+    },
+  };
+};
+
+export const withTeacherName = (record, name) => withTeacherEdits(record, { name });
+
 export function withoutToken(record) {
   if (!record) return record;
   const { token: _token, ...rest } = record;
@@ -199,6 +239,18 @@ export async function getStudent(classCode, studentId) {
   } catch {
     return null;
   }
+}
+
+export async function renameStudent(classCode, studentId, name) {
+  return updateStudentByTeacher(classCode, studentId, { name });
+}
+
+export async function updateStudentByTeacher(classCode, studentId, edits) {
+  const existing = await getStudent(classCode, studentId);
+  if (!existing) return null;
+  const next = withTeacherEdits(existing, edits);
+  await saveStudent(classCode, next);
+  return next;
 }
 
 export async function saveStudent(classCode, record) {

@@ -33,6 +33,8 @@ import {
 import { Button, Icon, ProgressRing, cn, type IconName } from "./ui";
 import {
   cloudErrorArabic,
+  parseBackupFile,
+  type BackupStudent,
   getTeacherPassword,
   rememberTeacherPassword,
   type CloudStatus,
@@ -57,6 +59,12 @@ export type TeacherCloud = {
   onClassCodeChange: (value: string) => void;
   onDelete: (ids: string[]) => Promise<{ ok: boolean; error?: string }>;
   onDeleteAll: () => Promise<{ ok: boolean; error?: string }>;
+  onRename: (
+    id: string,
+    edits: { name?: string; section?: Exclude<Student["section"], ""> },
+  ) => Promise<{ ok: boolean; error?: string }>;
+  onBackup: () => Promise<{ ok: boolean; error?: string }>;
+  onRestore: (records: BackupStudent[]) => Promise<{ ok: boolean; error?: string; imported?: number; skipped?: string[] }>;
 };
 
 
@@ -305,7 +313,19 @@ function TeacherLock({ onUnlock, onClose }: { onUnlock: (password: string) => vo
   );
 }
 
-export function TeacherPanel({ open, classroom, onChange, onClose, cloud, onRequestNewStudent }: TeacherPanelProps) {
+export function TeacherPanel({
+  open,
+  classroom,
+  onChange,
+  onClose,
+  cloud,
+  onRequestNewStudent,
+  onDownloadLocalBackup,
+  onRestoreLocal,
+}: TeacherPanelProps & {
+  onDownloadLocalBackup?: () => void;
+  onRestoreLocal?: (records: BackupStudent[]) => void;
+}) {
   const [unlocked, setUnlocked] = useState(readUnlocked);
   const [password, setPassword] = useState(getTeacherPassword);
 
@@ -343,6 +363,8 @@ export function TeacherPanel({ open, classroom, onChange, onClose, cloud, onRequ
       cloud={cloud}
       password={password}
       onRequestNewStudent={onRequestNewStudent}
+      onDownloadLocalBackup={onDownloadLocalBackup}
+      onRestoreLocal={onRestoreLocal}
       onLock={() => {
         try {
           window.sessionStorage.removeItem(UNLOCK_SESSION_KEY);
@@ -363,6 +385,8 @@ function TeacherDashboard({
   cloud,
   password,
   onRequestNewStudent,
+  onDownloadLocalBackup,
+  onRestoreLocal,
 }: {
   classroom: Classroom;
   onChange: (next: Classroom) => void;
@@ -371,6 +395,8 @@ function TeacherDashboard({
   cloud: TeacherCloud;
   password: string;
   onRequestNewStudent?: () => void;
+  onDownloadLocalBackup?: () => void;
+  onRestoreLocal?: (records: BackupStudent[]) => void;
 }) {
   const localStudents = classroom.students;
   const usingCloud = cloud.status === "ready" && cloud.students.length > 0;
@@ -413,12 +439,17 @@ function TeacherDashboard({
   const [message, setMessage] = useState<{ type: "success" | "error"; text: string } | null>(null);
   const [detailId, setDetailId] = useState<string | null>(null);
   const [detailName, setDetailName] = useState("");
+  const [detailSection, setDetailSection] = useState<Student["section"]>("");
   const [detailNotes, setDetailNotes] = useState("");
   const [confirmReset, setConfirmReset] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState(false);
   const [confirmClearAll, setConfirmClearAll] = useState(false);
   const [deletingId, setDeletingId] = useState<string | null>(null);
   const [deletingAll, setDeletingAll] = useState(false);
+  const [renaming, setRenaming] = useState(false);
+  const [backupBusy, setBackupBusy] = useState(false);
+  const [pendingRestore, setPendingRestore] = useState<BackupStudent[] | null>(null);
+  const restoreInputRef = useRef<HTMLInputElement>(null);
   const messageTimer = useRef<number | null>(null);
 
   const notify = (text: string, type: "success" | "error" = "success") => {
@@ -456,6 +487,7 @@ function TeacherDashboard({
     const student = students.find((item) => item.id === detailId);
     if (!student) return;
     setDetailName(student.name);
+    setDetailSection(student.section);
     setDetailNotes(student.notes);
     setConfirmReset(false);
     setConfirmDelete(false);
@@ -616,22 +648,129 @@ function TeacherDashboard({
     }
   };
 
-  const handleRename = () => {
-    if (!detail || !localStudents.some((student) => student.id === detail.id)) return;
+  const handleSaveStudentData = async () => {
+    if (!detail || renaming) return;
     const name = detailName.trim();
     if (name.length < 2) {
       notify("اكتب اسمًا من حرفين على الأقل.", "error");
       return;
     }
-    const updated = updateStudent(classroom, detail.id, (student) => ({ ...student, name }));
+    if (detailSection !== "٣/١" && detailSection !== "٣/٢") {
+      notify("اختر شعبة الطالب: ٣/١ أو ٣/٢.", "error");
+      return;
+    }
+
+    const isCloudRecord = Boolean((detail as CloudStudent).cloud) || !detailIsLocal;
+    const sectionChanged = detailSection !== detail.section;
+    const nameChanged = name !== detail.name;
+
+    if (isCloudRecord) {
+      if (cloud.status !== "ready") {
+        notify("يلزم تفعيل السجل المشترك لحفظ التعديل لكل الأجهزة. يمكنك حفظه محليًا من النسخة الاحتياطية.", "error");
+        return;
+      }
+      setRenaming(true);
+      try {
+        const result = await cloud.onRename(detail.id, {
+          ...(nameChanged ? { name } : {}),
+          ...(sectionChanged ? { section: detailSection as Exclude<Student["section"], ""> } : {}),
+        });
+        if (!result.ok) {
+          notify(cloudErrorArabic(result.error), "error");
+          return;
+        }
+        setDetailName(name);
+        setConfirmDelete(false);
+        notify(
+          sectionChanged
+            ? `حُفظت بيانات الطالب «${name}» والشعبة ${detailSection} في السجل المشترك.`
+            : `حُفظ اسم الطالب «${name}» في السجل المشترك، وسيظهر في جميع الأجهزة.`,
+        );
+      } finally {
+        setRenaming(false);
+      }
+      return;
+    }
+
+    const updated = updateStudent(classroom, detail.id, (student) => ({
+      ...student,
+      name,
+      section: detailSection,
+    }));
     onChange({
       ...updated,
       submissions: updated.submissions.map((submission) =>
-        submission.studentId === detail.id ? { ...submission, name } : submission,
+        submission.studentId === detail.id
+          ? { ...submission, name, section: detailSection as Exclude<Student["section"], ""> }
+          : submission,
       ),
     });
     setDetailName(name);
-    notify("تم تحديث اسم الطالب.");
+    notify(sectionChanged ? "تم تحديث اسم الطالب وشعبته وحفظها." : "تم تحديث اسم الطالب وحفظه.");
+  };
+
+  const handleBackup = async () => {
+    if (backupBusy) return;
+    setBackupBusy(true);
+    try {
+      if (cloud.status === "ready") {
+        const result = await cloud.onBackup();
+        notify(
+          result.ok
+            ? "تم تنزيل نسخة احتياطية بكل بيانات الطلاب. احتفظ بها لاستعادتها بعد أي نشر جديد."
+            : cloudErrorArabic(result.error),
+          result.ok ? "success" : "error",
+        );
+      } else if (onDownloadLocalBackup) {
+        onDownloadLocalBackup();
+        notify("تم تنزيل نسخة احتياطية للبيانات المحفوظة على هذا الجهاز.");
+      } else {
+        notify("لا توجد بيانات متاحة للنسخ الاحتياطي.", "error");
+      }
+    } finally {
+      setBackupBusy(false);
+    }
+  };
+
+  const handleRestoreFile = async (file: File | undefined) => {
+    if (!file) return;
+    try {
+      const text = await file.text();
+      const records = parseBackupFile(JSON.parse(text) as unknown);
+      if (records.length === 0) {
+        notify("الملف لا يحتوي على بيانات طلاب صالحة.", "error");
+        return;
+      }
+      setPendingRestore(records);
+    } catch {
+      notify("تعذّر قراءة ملف النسخة الاحتياطية. تأكد أنه ملف JSON صادر من هذا الدرس.", "error");
+    } finally {
+      if (restoreInputRef.current) restoreInputRef.current.value = "";
+    }
+  };
+
+  const confirmRestore = async () => {
+    if (!pendingRestore || backupBusy) return;
+    setBackupBusy(true);
+    try {
+      if (cloud.status === "ready") {
+        const result = await cloud.onRestore(pendingRestore);
+        if (!result.ok) {
+          notify(cloudErrorArabic(result.error), "error");
+          return;
+        }
+        notify(
+          `تمت استعادة ${ar(result.imported || pendingRestore.length)} سجلًا في السجل المشترك.` +
+            (result.skipped && result.skipped.length ? ` (تم تجاهل ${ar(result.skipped.length)})` : ""),
+        );
+      } else if (onRestoreLocal) {
+        onRestoreLocal(pendingRestore);
+        notify(`تمت استعادة ${ar(pendingRestore.length)} سجلًا على هذا الجهاز.`);
+      }
+      setPendingRestore(null);
+    } finally {
+      setBackupBusy(false);
+    }
   };
 
   const handleSaveNotes = () => {
@@ -657,85 +796,303 @@ function TeacherDashboard({
   };
 
   const handlePrint = () => {
-    const printWindow = window.open("", "_blank", "width=960,height=720");
+    const printWindow = window.open("", "_blank", "width=900,height=1000");
     if (!printWindow) {
       notify("يرجى السماح بالنوافذ المنبثقة لطباعة التقرير.", "error");
       return;
     }
 
-    const rows = students
-      .map((student) => {
-        const percent = completionPercent(student);
-        const stations = TASKS.map((task) => (student.completed[task.key] ? "✓" : "—")).join(" ");
-        return `<tr>
-          <td><strong>${escapeHtml(student.name)}</strong>${student.demo ? "<br><small>بيانات تجريبية</small>" : ""}</td>
-          <td class="num">${student.section || "—"}</td>
-          <td class="num">${percent}%</td>
-          <td class="center">${stations}</td>
-          <td class="num">${stationScore(student)} / 2</td>
-          <td class="num">${student.evaluationScore} / 3</td>
-          <td class="num"><strong>${totalScore(student)} / 5</strong></td>
-          <td class="num">${totalCorrect(student)}</td>
-          <td class="num">${totalIncorrect(student)}</td>
-          <td>${escapeHtml(formatLastActive(student.lastActive))}</td>
-          <td>${student.submittedAt ? `✓ ${escapeHtml(formatLastActive(student.submittedAt))}` : "لم يسلّم"}</td>
-        </tr>`;
+    const bySection = (section: "٣/١" | "٣/٢") => students.filter((student) => student.section === section);
+    const avgScore = (list: typeof students) =>
+      list.length ? Math.round((list.reduce((sum, student) => sum + totalScore(student), 0) / list.length) * 10) / 10 : 0;
+
+    const toneOf = (value: number) => (value >= 4 ? "good" : value >= 2.5 ? "mid" : value > 0 ? "low" : "zero");
+
+    const rows =
+      students.length === 0
+        ? `<tr><td colspan="6" class="empty">لا توجد بيانات طلاب في هذا السجل حتى الآن.</td></tr>`
+        : students
+            .map((student, index) => {
+              const percent = completionPercent(student);
+              const score = totalScore(student);
+              const tone = toneOf(score);
+              const stations = TASKS.map((task) => {
+                const done = student.completed[task.key];
+                return `<span class="chip ${done ? "on" : "off"}" title="${escapeHtml(task.label)}">
+                  <i>${done ? "✓" : "•"}</i><b>${escapeHtml(task.short)}</b>
+                </span>`;
+              }).join("");
+              const notes = student.notes
+                ? `<div class="note">📝 ${escapeHtml(student.notes.slice(0, 70))}${student.notes.length > 70 ? "…" : ""}</div>`
+                : "";
+              return `<tr>
+                <td class="idx">${index + 1}</td>
+                <td class="who">
+                  <div class="name">${escapeHtml(student.name)}</div>
+                  <div class="sub">
+                    <span class="sec">${escapeHtml(student.section || "—")}</span>
+                    ${student.demo ? `<span class="demo">تجريبي</span>` : ""}
+                    <span class="active">آخر نشاط: ${escapeHtml(formatLastActive(student.lastActive))}</span>
+                  </div>
+                  ${notes}
+                </td>
+                <td class="stations"><div class="chips">${stations}</div></td>
+                <td class="progress">
+                  <div class="pct ${percent === 100 ? "full" : percent >= 50 ? "half" : "part"}" dir="ltr">${percent}%</div>
+                  <div class="bar"><span style="width:${Math.max(percent, 3)}%"></span></div>
+                </td>
+                <td class="score">
+                  <div class="badge ${tone}" dir="ltr">${formatScore(score)}<small> / ${formatScore(TOTAL_MAX)}</small></div>
+                  <div class="split">محطات <span dir="ltr">${formatScore(stationScore(student))}/${formatScore(STATIONS_MAX)}</span> · تقويم <span dir="ltr">${student.evaluationScore}/٣</span></div>
+                </td>
+                <td class="submit">
+                  ${
+                    student.submittedAt
+                      ? `<span class="sent">✓ سلّم</span><div class="when">${escapeHtml(formatLastActive(student.submittedAt))}</div>`
+                      : `<span class="not-sent">لم يسلّم</span>`
+                  }
+                </td>
+              </tr>`;
+            })
+            .join("");
+
+    const sectionCards = (["٣/١", "٣/٢"] as const)
+      .map((section) => {
+        const list = bySection(section);
+        return `<div class="section-card">
+          <div class="s-label">شعبة ${section}</div>
+          <div class="s-value">${ar(list.length)} <small>طالب</small></div>
+          <div class="s-note">متوسط الدرجة <span dir="ltr" class="ratio">${formatScore(avgScore(list))}/${formatScore(TOTAL_MAX)}</span></div>
+        </div>`;
       })
       .join("");
 
+    const today = new Date().toLocaleDateString("ar-EG", {
+      weekday: "long",
+      day: "numeric",
+      month: "long",
+      year: "numeric",
+    });
+
     printWindow.document.write(`<!doctype html>
 <html dir="rtl" lang="ar"><head><meta charset="utf-8" />
-<title>تقرير إنجاز الصف - ${lesson.title}</title>
+<title>تقرير إنجاز الطلاب — ${escapeHtml(lesson.title)}</title>
 <style>
-  @page { size: A4 landscape; margin: 12mm; }
-  * { box-sizing: border-box; }
-  body { font-family: "Tahoma", "Segoe UI", sans-serif; color: #16312d; margin: 0; padding: 18px; }
-  .head { border: 2px solid #0e5d57; border-radius: 14px; padding: 16px 20px; margin-bottom: 16px; background: #f3faf8; }
-  h1 { margin: 0 0 4px; font-size: 22px; color: #0e3e3b; }
-  .sub { color: #5c736e; font-size: 12px; }
-  .meta { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 12px; font-size: 11px; }
-  .meta span { border: 1px solid #a9e2d7; border-radius: 999px; padding: 4px 9px; background: #fff; }
-  table { width: 100%; border-collapse: collapse; font-size: 11.5px; }
-  th { background: #0e5d57; color: #fff; padding: 8px; text-align: right; font-size: 11px; }
-  td { border-bottom: 1px solid #e6ecdd; padding: 8px; vertical-align: middle; }
-  tr:nth-child(even) td { background: #fdfaf2; }
-  .num { font-weight: bold; white-space: nowrap; }
-  .center { text-align: center; letter-spacing: 4px; font-weight: bold; color: #0f746b; }
-  small { color: #9a7025; font-size: 9px; }
-  .legend { margin-top: 12px; font-size: 10px; color: #5c736e; line-height: 1.8; }
-  .sign { display: flex; justify-content: space-between; margin-top: 28px; font-size: 11px; color: #5c736e; }
-  .sign div { border-top: 1px dashed #a9e2d7; width: 32%; padding-top: 6px; }
+  @page { size: A4 portrait; margin: 8mm 9mm; }
+  * { box-sizing: border-box; -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+  html, body { margin: 0; padding: 0; }
+  body {
+    font-family: "Tajawal", "Tahoma", "Segoe UI", sans-serif;
+    color: #16312d; background: #fff; font-size: 10px; line-height: 1.55;
+  }
+  .sheet { padding: 2mm 0 0; }
+
+  /* ---------------- Header ---------------- */
+  .hero {
+    position: relative; overflow: hidden; border-radius: 14px;
+    background: linear-gradient(120deg, #0e3e3b 0%, #0e5d57 55%, #1e9084 100%);
+    color: #fff; padding: 14px 16px 12px; margin-bottom: 10px;
+  }
+  .hero::after {
+    content: ""; position: absolute; left: -30px; top: -40px; width: 150px; height: 150px;
+    border-radius: 50%; background: rgba(255,255,255,.06);
+  }
+  .hero::before {
+    content: ""; position: absolute; left: 18px; bottom: -46px; width: 120px; height: 120px;
+    border: 14px solid rgba(214,170,79,.18); border-radius: 50%;
+  }
+  .hero-top { display: flex; align-items: center; justify-content: space-between; gap: 10px; position: relative; }
+  .brand { display: flex; align-items: center; gap: 8px; }
+  .logo {
+    width: 34px; height: 34px; border-radius: 10px; display: grid; place-items: center;
+    background: #d6aa4f; color: #0e3e3b; font-size: 17px; font-weight: 800;
+  }
+  .school { font-size: 11px; font-weight: 800; }
+  .teacher { font-size: 9px; color: #d3f0e9; }
+  .stamp {
+    border: 1px solid rgba(255,255,255,.3); background: rgba(255,255,255,.12);
+    border-radius: 999px; padding: 4px 10px; font-size: 8.5px; font-weight: 700; color: #f8f1df;
+  }
+  h1 { position: relative; margin: 9px 0 2px; font-size: 19px; letter-spacing: -.2px; }
+  .lesson { position: relative; margin: 0; font-size: 10.5px; color: #d3f0e9; font-weight: 600; }
+  .hero-meta {
+    position: relative; margin-top: 9px; display: flex; flex-wrap: wrap; gap: 6px;
+    font-size: 8.5px; color: #eafaf6;
+  }
+  .hero-meta span { background: rgba(255,255,255,.12); border-radius: 999px; padding: 3px 8px; }
+  .hero-meta .gold { background: #d6aa4f; color: #0e3e3b; font-weight: 800; }
+
+  /* ---------------- Stats ---------------- */
+  .stats { display: grid; grid-template-columns: repeat(5, 1fr); gap: 6px; margin-bottom: 8px; }
+  .stat { border-radius: 10px; padding: 7px 8px; border: 1px solid #e6ecdd; background: #fdfaf2; }
+  .stat .k { font-size: 7.5px; color: #5c736e; font-weight: 700; }
+  .stat .v { font-size: 14px; font-weight: 800; color: #0e3e3b; line-height: 1.3; }
+  .stat .v small { font-size: 7.5px; color: #5c736e; font-weight: 700; }
+  .stat.teal { background: #edf9f6; border-color: #a9e2d7; }
+  .stat.gold { background: #f8f1df; border-color: #e6d3a6; }
+  .stat.green { background: #e9f7ef; border-color: #b9e4c9; }
+  .stat.clay { background: #fdf0ea; border-color: #f0c9b4; }
+
+  .sections { display: flex; gap: 6px; margin-bottom: 9px; }
+  .section-card {
+    flex: 1; display: flex; align-items: center; gap: 8px;
+    border: 1px dashed #a9e2d7; background: #f4fbf9; border-radius: 10px; padding: 6px 9px;
+  }
+  .s-label { font-size: 9px; font-weight: 800; color: #0f746b; background: #fff; border-radius: 6px; padding: 2px 7px; }
+  .s-value { font-size: 12px; font-weight: 800; color: #0e3e3b; }
+  .s-value small { font-size: 7.5px; font-weight: 700; color: #5c736e; }
+  .s-note { margin-inline-start: auto; font-size: 8px; color: #5c736e; font-weight: 700; }
+  .ratio { unicode-bidi: isolate; white-space: nowrap; }
+
+  /* ---------------- Table ---------------- */
+  table { width: 100%; border-collapse: separate; border-spacing: 0; }
+  thead th {
+    background: #0e5d57; color: #fff; font-size: 8.5px; font-weight: 800;
+    padding: 7px 6px; text-align: right; border: none;
+  }
+  thead th:first-child { border-radius: 0 9px 0 0; }
+  thead th:last-child { border-radius: 9px 0 0 0; }
+  tbody td { padding: 6px 6px; border-bottom: 1px solid #e9f0e2; vertical-align: middle; }
+  tbody tr:nth-child(even) td { background: #fdfaf2; }
+  tbody tr:last-child td { border-bottom: 2px solid #0e5d57; }
+  .idx { width: 16px; text-align: center; font-size: 8px; font-weight: 800; color: #9db3ad; }
+  .who { width: 30%; }
+  .name { font-size: 10px; font-weight: 800; color: #0e3e3b; }
+  .sub { display: flex; flex-wrap: wrap; align-items: center; gap: 4px; margin-top: 2px; font-size: 7.5px; color: #5c736e; }
+  .sec { background: #d6aa4f; color: #0e3e3b; border-radius: 999px; padding: 1px 6px; font-weight: 800; font-size: 7.5px; }
+  .demo { background: #f0e4c8; color: #9a7025; border-radius: 999px; padding: 1px 5px; font-weight: 700; }
+  .note { margin-top: 2px; font-size: 7.5px; color: #9a7025; background: #fdf8ec; border-radius: 5px; padding: 1px 5px; }
+
+  .stations { width: 20%; }
+  .chips { display: flex; flex-wrap: wrap; gap: 3px; }
+  .chip {
+    display: inline-flex; align-items: center; gap: 2px; border-radius: 6px;
+    padding: 2px 4px; font-size: 7px; border: 1px solid #e6ecdd; background: #fff; color: #9db3ad;
+  }
+  .chip i { font-style: normal; font-size: 7px; }
+  .chip b { font-weight: 800; }
+  .chip.on { background: #e9f7ef; border-color: #73cbbd; color: #0e5d57; }
+  .chip.on i { color: #0f746b; }
+
+  .progress { width: 12%; }
+  .pct { font-size: 10px; font-weight: 800; }
+  .pct.full { color: #0f746b; }
+  .pct.half { color: #bc8d31; }
+  .pct.part { color: #b8623d; }
+  .bar { height: 4px; border-radius: 999px; background: #e8f1ec; overflow: hidden; margin-top: 3px; }
+  .bar span { display: block; height: 100%; border-radius: 999px; background: linear-gradient(90deg, #d6aa4f, #1e9084); }
+
+  .score { width: 15%; }
+  .badge {
+    display: inline-block; border-radius: 8px; padding: 3px 7px; font-size: 11px; font-weight: 800;
+    border: 1px solid transparent;
+  }
+  .badge small { font-size: 7.5px; font-weight: 700; opacity: .75; }
+  .badge.good { background: #e9f7ef; color: #0e5d57; border-color: #73cbbd; }
+  .badge.mid { background: #f8f1df; color: #9a7025; border-color: #e6d3a6; }
+  .badge.low { background: #fdf0ea; color: #b8623d; border-color: #f0c9b4; }
+  .badge.zero { background: #f3f6f4; color: #9db3ad; border-color: #e6ecdd; }
+  .split { font-size: 7px; color: #5c736e; margin-top: 2px; font-weight: 700; }
+  .split span { unicode-bidi: isolate; }
+
+  .submit { width: 13%; font-size: 8px; }
+  .sent { color: #0f746b; font-weight: 800; }
+  .not-sent { color: #b8623d; font-weight: 700; }
+  .when { color: #9db3ad; font-size: 7px; margin-top: 1px; }
+  .empty { text-align: center; padding: 24px; color: #5c736e; font-weight: 700; }
+
+  /* ---------------- Footer ---------------- */
+  .legend {
+    margin-top: 9px; border: 1px solid #e6ecdd; background: #fcfdfa; border-radius: 10px;
+    padding: 7px 9px; font-size: 7.8px; color: #5c736e; line-height: 1.85;
+  }
+  .legend b { color: #0e3e3b; }
+  .legend .dots { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 3px; }
+  .legend .dot { display: inline-flex; align-items: center; gap: 3px; }
+  .legend .sw { width: 8px; height: 8px; border-radius: 2px; display: inline-block; }
+  .sign { display: flex; justify-content: space-between; gap: 14px; margin-top: 20px; font-size: 8.5px; color: #5c736e; }
+  .sign div { flex: 1; border-top: 1px dashed #a9e2d7; padding-top: 6px; text-align: center; }
+  .foot {
+    display: flex; justify-content: space-between; align-items: center; gap: 8px;
+    margin-top: 10px; border-top: 2px solid #0e5d57; padding-top: 5px; font-size: 7.5px; color: #9db3ad;
+  }
+  .foot .brandline { display: inline-flex; align-items: center; gap: 4px; color: #0f746b; font-weight: 800; }
+  @media print { body { font-size: 10px; } thead { display: table-header-group; } tr { page-break-inside: avoid; } }
 </style></head>
 <body>
-  <header class="head">
-    <h1>تقرير إنجاز الطلاب — ${lesson.title}</h1>
-    <div class="sub">${lesson.subject} · ${lesson.grade} · ${lesson.audience} · ${lesson.number}</div>
-    <div class="meta">
-      <span>عدد الطلاب: ${ar(stats.total)}</span>
-      <span>متوسط الإنجاز: ${ar(stats.average)}٪</span>
-      <span>متوسط الدرجة: ${formatScore(stats.averageScore)} / ${formatScore(TOTAL_MAX)}</span>
-      <span>أتموا الرحلة: ${ar(stats.finished)}</span>
-      <span>تسليمات الطلاب: ${ar(classroom.submissions.length)}</span>
-      <span>يحتاجون متابعة: ${ar(stats.support)}</span>
-      <span>تاريخ التقرير: ${formatFullDate(nowISO())}</span>
+  <div class="sheet">
+    <header class="hero">
+      <div class="hero-top">
+        <div class="brand">
+          <div class="logo"><svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M4 21V9l8-5 8 5v12"/><path d="M4 21h16M9 21v-6h6v6"/></svg></div>
+          <div>
+            <div class="school">${escapeHtml(teacher.school)}</div>
+            <div class="teacher">${escapeHtml(teacher.role)}: ${escapeHtml(teacher.name)}</div>
+          </div>
+        </div>
+        <div class="stamp">تقرير رسمي · ${escapeHtml(today)}</div>
+      </div>
+      <h1>تقرير إنجاز الطلاب</h1>
+      <p class="lesson">${escapeHtml(lesson.title)} — ${escapeHtml(lesson.subject)} · ${escapeHtml(lesson.grade)} · ${escapeHtml(lesson.audience)}</p>
+      <div class="hero-meta">
+        <span>${escapeHtml(lesson.number)}</span>
+        <span>رمز الصف: ${escapeHtml(cloud.classCode)}</span>
+        <span>قاعدة البيانات: ${escapeHtml(cloud.provider || "محلي")}</span>
+        <span class="gold">الدرجة الكلية من ${formatScore(TOTAL_MAX)}</span>
+      </div>
+    </header>
+
+    <section class="stats">
+      <div class="stat teal"><div class="k">طلاب السجل</div><div class="v">${ar(stats.total)} <small>طالب</small></div></div>
+      <div class="stat"><div class="k">متوسط الإنجاز</div><div class="v" dir="ltr">${ar(stats.average)}%</div></div>
+      <div class="stat gold"><div class="k">متوسط الدرجة</div><div class="v" dir="ltr">${formatScore(stats.averageScore)} <small>/ ${formatScore(TOTAL_MAX)}</small></div></div>
+      <div class="stat green"><div class="k">أتموا الرحلة</div><div class="v">${ar(stats.finished)}</div></div>
+      <div class="stat clay"><div class="k">تسليمات الطلاب</div><div class="v">${ar(classroom.submissions.length)}</div></div>
+    </section>
+
+    <section class="sections">${sectionCards}</section>
+
+    <table>
+      <thead>
+        <tr>
+          <th></th>
+          <th>الطالب والشعبة</th>
+          <th>المحطات</th>
+          <th>الإنجاز</th>
+          <th>الدرجة</th>
+          <th>التسليم</th>
+        </tr>
+      </thead>
+      <tbody>${rows}</tbody>
+    </table>
+
+    <div class="legend">
+      <b>طريقة الاحتساب:</b> كل محطة مكتملة (✓) = نصف درجة، والمحطات الأربع = ٢ درجات، وتُضاف درجة التقويم من ٣، فالدرجة الكلية من ٥.
+      تُحسب نسبة الإنجاز من المحطات الأربع: أقرأ وأجيب، نشاط الحديث، مكانة الصلاة وحكم أدائها، التقويم.
+      <div class="dots">
+        <span class="dot"><i class="sw" style="background:#0e5d57"></i> ٤–٥ ممتاز</span>
+        <span class="dot"><i class="sw" style="background:#bc8d31"></i> ٢٫٥–٣٫٩ جيد</span>
+        <span class="dot"><i class="sw" style="background:#b8623d"></i> أقل من ٢٫٥ يحتاج متابعة</span>
+        <span class="dot"><i class="sw" style="background:#d6aa4f"></i> الشعبة</span>
+      </div>
     </div>
-  </header>
-  <table>
-    <thead><tr>
-      <th>الطالب</th><th>الصف</th><th>نسبة الإنجاز</th><th>المحطات (أقرأ / نشاط / المكانة / التقويم)</th>
-      <th>درجة المحطات /٢</th><th>التقويم /٣</th><th>الدرجة الكلية /٥</th><th>صحيحة</th><th>أخطاء</th><th>آخر نشاط</th><th>التسليم للمعلم</th>
-    </tr></thead>
-    <tbody>${rows}</tbody>
-  </table>
-  <p class="legend">
-    ✓ محطة مكتملة — محطة غير مكتملة. نسبة الإنجاز محسوبة من أربع محطات: أقرأ وأجيب، نشاط الحديث، مكانة الصلاة وحكم أدائها، التقويم.
-    الدرجة الكلية من ٥: نصف درجة لكل محطة مكتملة (٢) + درجة التقويم من ٣. تُحفظ البيانات في قاعدة البيانات المشتركة عند تفعيلها.
-  </p>
-  <div class="sign"><div>توقيع المعلم</div><div>ملاحظات الإدارة</div><div>توقيع ولي الأمر</div></div>
+
+    <div class="sign">
+      <div>توقيع المعلم: ${escapeHtml(teacher.name)}</div>
+      <div>ملاحظات الإدارة</div>
+      <div>توقيع ولي الأمر</div>
+    </div>
+
+    <footer class="foot">
+      <span class="brandline"><svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M4 21V9l8-5 8 5v12"/><path d="M4 21h16M9 21v-6h6v6"/></svg> ${escapeHtml(teacher.school)}</span>
+      <span>${escapeHtml(lesson.title)} · ${escapeHtml(lesson.grade)}</span>
+      <span>تم إنشاء التقرير في <span dir="rtl">${escapeHtml(new Date().toLocaleString("ar-EG"))}</span></span>
+    </footer>
+  </div>
 </body></html>`);
     printWindow.document.close();
     printWindow.focus();
-    window.setTimeout(() => printWindow.print(), 350);
+    window.setTimeout(() => printWindow.print(), 400);
   };
 
   const filterOptions: { id: Filter; label: string; count: number }[] = [
@@ -1166,6 +1523,66 @@ function TeacherDashboard({
                 </button>
               </div>
             </div>
+
+            <div className="mt-2.5 flex flex-wrap items-center gap-1.5">
+              <button
+                type="button"
+                onClick={() => void handleBackup()}
+                disabled={backupBusy}
+                className="inline-flex items-center gap-1.5 rounded-full border border-brand-200 bg-white px-3 py-1.5 text-[10px] font-extrabold text-brand-700 transition hover:border-brand-400 hover:bg-brand-50 disabled:opacity-50"
+                title="تنزيل نسخة JSON لكل بيانات الطلاب"
+              >
+                <Icon name="download" className="h-3.5 w-3.5" />
+                {backupBusy ? "جارٍ التنزيل..." : "نسخة احتياطية"}
+              </button>
+              <button
+                type="button"
+                onClick={() => restoreInputRef.current?.click()}
+                disabled={backupBusy}
+                className="inline-flex items-center gap-1.5 rounded-full border border-brand-200 bg-white px-3 py-1.5 text-[10px] font-extrabold text-brand-700 transition hover:border-brand-400 hover:bg-brand-50 disabled:opacity-50"
+                title="استعادة بيانات الطلاب من ملف نسخة احتياطية"
+              >
+                <Icon name="refresh" className="h-3.5 w-3.5" />
+                استعادة
+              </button>
+              <input
+                ref={restoreInputRef}
+                type="file"
+                accept="application/json,.json"
+                className="sr-only"
+                aria-label="ملف النسخة الاحتياطية"
+                onChange={(event) => void handleRestoreFile(event.target.files?.[0])}
+              />
+              <span className="text-[9px] font-medium leading-5 text-muted">
+                {cloud.status === "ready"
+                  ? "النسخة الاحتياطية تحفظ أسماء الطلاب والدرجات والتسليمات، وتُستعاد بعد أي نشر جديد."
+                  : "تحفظ بيانات هذا الجهاز وتُستعاد عليه؛ فعّل السجل المشترك لحفظها لكل الأجهزة."}
+              </span>
+            </div>
+
+            {pendingRestore && (
+              <div className="mt-3 rounded-xl border-2 border-brand-300 bg-brand-50 p-3">
+                <div className="flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between">
+                  <div>
+                    <p className="flex items-center gap-2 text-[11px] font-extrabold text-brand-900">
+                      <Icon name="refresh" className="h-4 w-4 shrink-0 text-brand-600" />
+                      استعادة {ar(pendingRestore.length)} سجلًا من النسخة الاحتياطية
+                    </p>
+                    <p className="mt-1 text-[9px] leading-5 text-brand-700">
+                      سيتم تحديث السجلات التي تحمل المعرف نفسه، وإضافة السجلات الجديدة. الأسماء المعدّلة من المعلم تبقى محفوظة.
+                    </p>
+                  </div>
+                  <div className="flex shrink-0 gap-2">
+                    <Button size="sm" variant="ghost" onClick={() => setPendingRestore(null)}>
+                      إلغاء
+                    </Button>
+                    <Button size="sm" icon="check" disabled={backupBusy} onClick={() => void confirmRestore()}>
+                      {backupBusy ? "جارٍ الاستعادة..." : "تأكيد الاستعادة"}
+                    </Button>
+                  </div>
+                </div>
+              </div>
+            )}
 
             {confirmClearAll && (
               <div className="mt-3 flex flex-col gap-2 rounded-xl border-2 border-clay-400/40 bg-orange-50 p-3 sm:flex-row sm:items-center sm:justify-between">
@@ -1817,24 +2234,67 @@ function TeacherDashboard({
                 <label htmlFor="student-name" className="mb-1.5 block text-[10px] font-extrabold text-brand-900">
                   اسم الطالب
                 </label>
-                <div className="flex gap-1.5">
-                  <input
-                    id="student-name"
-                    value={detailName}
-                    onChange={(event) => setDetailName(event.target.value)}
-                    maxLength={40}
-                    className="min-w-0 flex-1 rounded-lg border border-brand-200 px-2.5 py-1.5 text-xs font-bold text-ink outline-none focus:border-brand-500 focus:ring-2 focus:ring-brand-500/15"
-                  />
-                  <Button
-                    size="sm"
-                    variant="secondary"
-                    icon="pen"
-                    onClick={handleRename}
-                    disabled={!detailIsLocal || detailName.trim() === detail.name}
-                  >
-                    حفظ
-                  </Button>
+                <input
+                  id="student-name"
+                  value={detailName}
+                  onChange={(event) => setDetailName(event.target.value)}
+                  maxLength={40}
+                  placeholder="اسم الطالب"
+                  className="w-full rounded-lg border border-brand-200 px-2.5 py-1.5 text-xs font-bold text-ink outline-none focus:border-brand-500 focus:ring-2 focus:ring-brand-500/15"
+                />
+
+                <p className="mb-1.5 mt-2.5 block text-[10px] font-extrabold text-brand-900">الشعبة</p>
+                <div className="grid grid-cols-2 gap-1.5" role="radiogroup" aria-label="شعبة الطالب">
+                  {(["٣/١", "٣/٢"] as const).map((section) => {
+                    const selected = detailSection === section;
+                    return (
+                      <button
+                        key={section}
+                        type="button"
+                        role="radio"
+                        aria-checked={selected}
+                        onClick={() => setDetailSection(section)}
+                        className={cn(
+                          "flex items-center justify-between gap-1.5 rounded-lg border px-2.5 py-2 text-[11px] font-extrabold transition",
+                          selected
+                            ? "border-brand-600 bg-brand-50 text-brand-900"
+                            : "border-brand-200 bg-white text-brand-600 hover:border-brand-300 hover:bg-sand-50",
+                        )}
+                      >
+                        <span>الصف {section}</span>
+                        <span
+                          className={cn(
+                            "grid h-4 w-4 place-items-center rounded-full border-2",
+                            selected ? "border-brand-600 bg-brand-600 text-white" : "border-brand-200",
+                          )}
+                        >
+                          {selected && <Icon name="check" className="h-2.5 w-2.5" />}
+                        </span>
+                      </button>
+                    );
+                  })}
                 </div>
+
+                <Button
+                  size="sm"
+                  variant="primary"
+                  icon={renaming ? "refresh" : "pen"}
+                  onClick={() => void handleSaveStudentData()}
+                  disabled={
+                    renaming ||
+                    detailName.trim().length < 2 ||
+                    (detailName.trim() === detail.name && detailSection === detail.section)
+                  }
+                  className="mt-2.5 w-full"
+                >
+                  {renaming ? "جارٍ الحفظ..." : "حفظ اسم الطالب والشعبة"}
+                </Button>
+                <p className="mt-1.5 flex items-start gap-1.5 text-[9px] leading-4 text-muted">
+                  <Icon name="shield" className="mt-0.5 h-3 w-3 shrink-0 text-brand-400" />
+                  {cloud.status === "ready"
+                    ? "تُحفظ البيانات في السجل المشترك وتظهر لجميع الأجهزة، ولا يستطيع جهاز الطالب الكتابة فوقها."
+                    : "تُحفظ على هذا الجهاز. فعّل السجل المشترك ليُحفظ لكل الأجهزة وبعد النشر."}
+                </p>
               </div>
 
               <div className="rounded-xl border border-brand-100 bg-white p-3">

@@ -712,3 +712,88 @@ export function clearAllStudents(classroom: Classroom): Classroom {
   const placeholder = createStudent(PLACEHOLDER_NAME);
   return { ...classroom, activeId: placeholder.id, students: [placeholder], submissions: [] };
 }
+
+
+/* ------------------------- استعادة النسخة الاحتياطية ------------------------ */
+
+export type RestoreRecord = {
+  id: string;
+  name: string;
+  section: StudentSection;
+  completed?: Partial<Record<TaskKey, boolean>>;
+  results?: Record<string, unknown>;
+  evaluationScore?: number;
+  submittedAt?: string | null;
+  createdAt?: string;
+  lastActive?: string;
+  percent?: number;
+  completedCount?: number;
+};
+
+export function restoreBackupToClassroom(classroom: Classroom, records: RestoreRecord[]): Classroom {
+  const byId = new Map(classroom.students.map((student) => [student.id, student]));
+  let restored = 0;
+
+  records.forEach((raw) => {
+    if (!raw || typeof raw.id !== "string" || raw.name.trim().length < 2) return;
+    if (!STUDENT_SECTIONS.includes(raw.section as (typeof STUDENT_SECTIONS)[number])) return;
+    const previous = byId.get(raw.id);
+    const completedSource = raw.completed ?? {};
+    const completed = Object.fromEntries(
+      TASK_KEYS.map((key) => [key, Boolean((completedSource as Record<string, unknown>)[key])]),
+    ) as Record<TaskKey, boolean>;
+    const results = {} as Record<TaskKey, StationResult>;
+    TASK_KEYS.forEach((key) => {
+      const entry = (raw.results ?? {})[key] as { correct?: number; incorrect?: number } | undefined;
+      results[key] = {
+        correct: Math.max(0, Number(entry?.correct) || 0),
+        incorrect: Math.max(0, Number(entry?.incorrect) || 0),
+        lastStatus: null,
+        updatedAt: null,
+      };
+    });
+    byId.set(raw.id, {
+      ...(previous ?? createStudent(raw.name)),
+      id: raw.id,
+      name: raw.name.trim().slice(0, 48),
+      section: raw.section,
+      submittedAt: typeof raw.submittedAt === "string" ? raw.submittedAt : null,
+      createdAt: previous?.createdAt || raw.createdAt || nowISO(),
+      lastActive: raw.lastActive || nowISO(),
+      completed,
+      results,
+      evaluationScore: Math.max(0, Math.min(3, Number(raw.evaluationScore) || 0)),
+      notes: previous?.notes ?? "",
+    });
+    restored += 1;
+  });
+
+  let students = [...byId.values()];
+  if (restored > 0) {
+    const real = students.filter((student) => student.name !== "طالب الصف الثالث");
+    if (real.length > 0) students = real;
+  }
+  const activeId = students.some((student) => student.id === classroom.activeId)
+    ? classroom.activeId
+    : students[0]?.id ?? classroom.activeId;
+
+  const submissions: StudentSubmission[] = students
+    .filter((student) => student.submittedAt)
+    .map((student) => ({
+      id: `restored-${student.id}`,
+      studentId: student.id,
+      name: student.name,
+      section: student.section as Exclude<StudentSection, "">,
+      percent: completionPercent(student),
+      completedCount: completedCount(student),
+      evaluationScore: student.evaluationScore,
+      submittedAt: student.submittedAt as string,
+    }));
+
+  return {
+    ...classroom,
+    activeId,
+    students,
+    submissions: restored > 0 ? submissions : classroom.submissions,
+  };
+}
